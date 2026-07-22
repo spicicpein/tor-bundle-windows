@@ -16,8 +16,8 @@ github.com/golang/text v0.3.6/go.mod h1:5Zoc/QRtKVWzQhOtBMvqHzDpF6irO9z98xDceosu
 github.com/golang/tools v0.0.0-20180917221912-90fa682c2a6e/go.mod h1:BZR6KJOI/IQ5FlSQroxL7yevEMRCz1dARTXHD9s4mHE=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
-github.com/spicicpein/go-libtor v1.2.1-0.20260722060237-8ac7fa38eca9 h1:9NiGui6goXtZ8Lf9mrdTp4Fk3fT4PFnVJtiKIrwsvA0=
-github.com/spicicpein/go-libtor v1.2.1-0.20260722060237-8ac7fa38eca9/go.mod h1:XjJS0SJ0EgnwvZDRMuSWBwlDpu79cpw/XcdVLMx6FWY=
+github.com/spicicpein/go-libtor v1.2.1-0.20260722115239-91b74f56c2c3 h1:4FFAAODbEywRZE3A/KtrtAxrS2kBFormxjp0SAKIk8o=
+github.com/spicicpein/go-libtor v1.2.1-0.20260722115239-91b74f56c2c3/go.mod h1:XjJS0SJ0EgnwvZDRMuSWBwlDpu79cpw/XcdVLMx6FWY=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
 github.com/stretchr/testify v1.7.0 h1:nwc3DEeHmmLAfoZucVR881uASk0Mfjw8xYJ99tb5CcY=
 github.com/stretchr/testify v1.7.0/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=

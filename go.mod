@@ -33,4 +33,4 @@ require (
 	golang.org/x/sys v0.0.0-20220310020820-b874c991c1a5 // indirect
 )
 
-replace github.com/gen2brain/go-libtor => github.com/spicicpein/go-libtor v1.2.1-0.20260722060237-8ac7fa38eca9
+replace github.com/gen2brain/go-libtor => github.com/spicicpein/go-libtor v1.2.1-0.20260722115239-91b74f56c2c3
