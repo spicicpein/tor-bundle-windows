@@ -53,3 +53,14 @@ jobs:
           name: tor-bundle-windows
           path: tor-bundle-windows.exe
           retention-days: 30
+
+      - name: Publish release
+        if: steps.build.outputs.buildexit == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest tor-bundle-windows.exe \
+            --title "Latest build" \
+            --notes "Automatic build from commit ${GITHUB_SHA}" \
+            --repo "${GITHUB_REPOSITORY}"
