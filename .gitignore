@@ -1,0 +1,5 @@
+embedded/*.exe
+tortest.exe
+tor-bundle-windows.exe
+bundle-extract/
+expert-bundle.tar.gz

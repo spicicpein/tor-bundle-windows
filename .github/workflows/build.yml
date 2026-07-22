@@ -24,6 +24,19 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
 
+      - name: Fetch official pluggable transport binaries
+        run: |
+          set -e
+          curl -sL -o expert-bundle.tar.gz \
+            "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.8/tor-expert-bundle-windows-x86_64-15.0.8.tar.gz"
+          mkdir -p bundle-extract
+          tar -xzf expert-bundle.tar.gz -C bundle-extract
+          find bundle-extract -iname "*.exe" -o -iname "*.dll"
+          mkdir -p embedded
+          find bundle-extract -iname "lyrebird.exe" -exec cp {} embedded/lyrebird.exe \;
+          find bundle-extract -iname "snowflake-client.exe" -exec cp {} embedded/snowflake-client.exe \;
+          ls -la embedded/
+
       - name: Build tor-bundle-windows.exe
         id: build
         env:

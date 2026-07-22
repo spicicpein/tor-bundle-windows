@@ -2,17 +2,22 @@
 //
 // Embeds the Tor core in-process (via go-libtor, cgo) - no subprocess for
 // Tor itself. Exposes a local SOCKS5 proxy and a persistent Hidden Service
-// that forwards to a local address you configure.
+// that forwards to a local address you configure. Optionally uses obfs4/
+// webtunnel (lyrebird) or snowflake bridges if the network blocks Tor
+// directly - the transport binaries are embedded in this exe and only
+// extracted to disk if bridges are actually configured.
 //
-// All working files (Tor's data directory, the onion service key, and the
-// config file) live in a "tor-data" folder right next to this executable -
-// nothing is written to AppData, Temp, or any other hidden location.
+// All working files (Tor's data directory, the onion service key, the
+// config file, and extracted transport binaries if needed) live in a
+// "tor-data" folder right next to this executable - nothing is written to
+// AppData, Temp, or any other hidden location.
 package main
 
 import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,12 +31,26 @@ import (
 	"github.com/gen2brain/go-libtor"
 )
 
+//go:embed embedded/lyrebird.exe
+var lyrebirdBin []byte
+
+//go:embed embedded/snowflake-client.exe
+var snowflakeBin []byte
+
+type bridgeLine = string
+
 type config struct {
 	// Local address that incoming onion connections get forwarded to.
 	// Example: "127.0.0.1:22" for SSH, "127.0.0.1:8080" for a web panel.
 	ForwardTo string `json:"forward_to"`
 	// Virtual port the .onion address listens on (what people connect to).
 	OnionPort int `json:"onion_port"`
+	// Bridge lines to use if the network blocks Tor directly. Leave empty
+	// to try a direct connection only. Get bridge lines from Tor Browser's
+	// built-in bridge menu, https://bridges.torproject.org, or the
+	// @GetBridgesBot Telegram bot, then paste them here (one per line/entry)
+	// and restart. Supports obfs4/webtunnel (lyrebird) and snowflake lines.
+	Bridges []bridgeLine `json:"bridges"`
 }
 
 func exeDir() string {
@@ -58,12 +77,12 @@ func loadOrCreateConfig(path string) (*config, error) {
 	if !os.IsNotExist(err) {
 		return nil, err
 	}
-	c := &config{ForwardTo: "127.0.0.1:22", OnionPort: 22}
+	c := &config{ForwardTo: "127.0.0.1:22", OnionPort: 22, Bridges: []bridgeLine{}}
 	b, _ = json.MarshalIndent(c, "", "  ")
 	if err := os.WriteFile(path, b, 0644); err != nil {
 		return nil, err
 	}
-	log.Printf("wrote default config to %s - edit forward_to/onion_port and restart if needed", path)
+	log.Printf("wrote default config to %s - edit it (forward_to, onion_port, bridges) and restart if needed", path)
 	return c, nil
 }
 
@@ -81,6 +100,33 @@ func loadOrCreateOnionKey(path string) (ed25519.PrivateKey, error) {
 	}
 	log.Printf("generated a new onion service key at %s (keep this file to keep the same .onion address)", path)
 	return priv, nil
+}
+
+// extractTransports writes the embedded lyrebird/snowflake binaries to
+// binDir (only called when bridges are actually configured) and returns
+// their paths plus the ClientTransportPlugin lines to pass to tor.
+func extractTransports(binDir string) (lyrebirdPath, snowflakePath string, err error) {
+	if err = os.MkdirAll(binDir, 0700); err != nil {
+		return "", "", err
+	}
+	lyrebirdPath = filepath.Join(binDir, "lyrebird.exe")
+	snowflakePath = filepath.Join(binDir, "snowflake-client.exe")
+	if err = os.WriteFile(lyrebirdPath, lyrebirdBin, 0755); err != nil {
+		return "", "", err
+	}
+	if err = os.WriteFile(snowflakePath, snowflakeBin, 0755); err != nil {
+		return "", "", err
+	}
+	return lyrebirdPath, snowflakePath, nil
+}
+
+func usesSnowflake(bridges []bridgeLine) bool {
+	for _, b := range bridges {
+		if len(b) >= 9 && b[:9] == "snowflake" {
+			return true
+		}
+	}
+	return false
 }
 
 func proxyConn(a net.Conn, forwardTo string) {
@@ -113,30 +159,69 @@ func main() {
 		log.Fatalf("onion key: %v", err)
 	}
 
-	log.Println("starting embedded Tor core (first run can take a while)...")
-	t, err := tor.Start(nil, &tor.StartConf{
+	startConf := &tor.StartConf{
 		ProcessCreator:    libtor.Creator,
 		DataDir:           filepath.Join(base, "state"),
 		RetainTempDataDir: true,
-	})
+	}
+
+	usingBridges := len(cfg.Bridges) > 0
+	if usingBridges {
+		log.Printf("config has %d bridge line(s) configured - starting with bridges from the start", len(cfg.Bridges))
+		lyrebirdPath, snowflakePath, err := extractTransports(filepath.Join(base, "bin"))
+		if err != nil {
+			log.Fatalf("extracting transport binaries: %v", err)
+		}
+		args := []string{
+			"--ClientTransportPlugin", "obfs4,webtunnel exec " + lyrebirdPath,
+			"--UseBridges", "1",
+		}
+		if usesSnowflake(cfg.Bridges) {
+			args = append(args, "--ClientTransportPlugin", "snowflake exec "+snowflakePath)
+		}
+		for _, b := range cfg.Bridges {
+			args = append(args, "--Bridge", b)
+		}
+		startConf.ExtraArgs = args
+	} else {
+		log.Println("no bridges configured - trying a direct connection first")
+	}
+
+	log.Println("starting embedded Tor core (first run can take a while)...")
+	t, err := tor.Start(nil, startConf)
 	if err != nil {
 		log.Fatalf("failed to start tor: %v", err)
 	}
 	defer t.Close()
 
-	bootCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	timeout := 5 * time.Minute
+	if !usingBridges {
+		timeout = 90 * time.Second
+	}
+	bootCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	dialer, err := t.Dialer(bootCtx, nil)
+	if err == nil {
+		if conn, derr := dialer.DialContext(bootCtx, "tcp", "check.torproject.org:80"); derr == nil {
+			conn.Close()
+			err = nil
+		} else {
+			err = derr
+		}
+	}
 	if err != nil {
-		log.Fatalf("failed to create dialer: %v", err)
+		if usingBridges {
+			log.Fatalf("could not bootstrap even with the configured bridges: %v", err)
+		}
+		log.Println("could not connect directly - the network may be blocking Tor.")
+		log.Println("To use bridges: open tor-data/config.json, get bridge lines from")
+		log.Println("Tor Browser's built-in bridge menu, https://bridges.torproject.org,")
+		log.Println("or the @GetBridgesBot Telegram bot, paste them into \"bridges\", and")
+		log.Println("restart this program.")
+		log.Fatalf("bootstrap failed: %v", err)
 	}
-	if conn, err := dialer.DialContext(bootCtx, "tcp", "check.torproject.org:80"); err != nil {
-		log.Fatalf("bootstrap check failed: %v", err)
-	} else {
-		conn.Close()
-		log.Println("Tor bootstrapped, network reachable.")
-	}
+	log.Println("Tor bootstrapped, network reachable.")
 
 	onion, err := t.Listen(bootCtx, &tor.ListenConf{
 		Key:         key,
