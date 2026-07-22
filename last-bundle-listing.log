@@ -1,0 +1,21 @@
+=== full bundle listing ===
+bundle-extract/tor/pluggable_transports/lyrebird.exe
+bundle-extract/tor/pluggable_transports/conjure-client.exe
+bundle-extract/tor/pluggable_transports/README.CONJURE.md
+bundle-extract/tor/pluggable_transports/pt_config.json
+bundle-extract/tor/tor-gencert.exe
+bundle-extract/tor/tor.exe
+bundle-extract/data/torrc-defaults
+bundle-extract/data/geoip6
+bundle-extract/data/geoip
+bundle-extract/docs/lyrebird.txt
+bundle-extract/docs/openssl.txt
+bundle-extract/docs/libevent.txt
+bundle-extract/docs/tor.txt
+bundle-extract/docs/conjure.txt
+bundle-extract/docs/zlib.txt
+total 17524
+drwxr-xr-x 2 runner runner     4096 Jul 22 18:13 .
+drwxr-xr-x 7 runner runner     4096 Jul 22 18:13 ..
+-rw-r--r-- 1 runner runner        0 Jul 22 18:13 .gitkeep
+-rwx------ 1 runner runner 17934336 Jul 22 18:13 lyrebird.exe
