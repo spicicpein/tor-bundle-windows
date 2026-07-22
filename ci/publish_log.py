@@ -1,12 +1,18 @@
-import base64, json, os, urllib.request
+import base64, json, os, sys, urllib.request
+
+src = sys.argv[1] if len(sys.argv) > 1 else "build-output-tail.log"
+dst = sys.argv[2] if len(sys.argv) > 2 else "last-build-error.log"
 
 repo = os.environ["GITHUB_REPOSITORY"]
 token = os.environ["GH_TOKEN"]
 sha = os.environ["GITHUB_SHA"]
-with open("build-output-tail.log", "rb") as f:
+if not os.path.exists(src):
+    print(f"{src} does not exist, skipping publish")
+    sys.exit(0)
+with open(src, "rb") as f:
     content = f.read()
 
-url = f"https://api.github.com/repos/{repo}/contents/last-build-error.log"
+url = f"https://api.github.com/repos/{repo}/contents/{dst}"
 req = urllib.request.Request(url, headers={"Authorization": f"token {token}"})
 sha_existing = None
 try:
