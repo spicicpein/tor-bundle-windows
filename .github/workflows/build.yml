@@ -36,7 +36,6 @@ jobs:
           cat bundle-listing.log
           mkdir -p embedded
           find bundle-extract -iname "lyrebird.exe" -exec cp {} embedded/lyrebird.exe \;
-          find bundle-extract -iname "snowflake-client.exe" -exec cp {} embedded/snowflake-client.exe \;
           ls -la embedded/ >> bundle-listing.log || true
 
       - name: Publish bundle listing

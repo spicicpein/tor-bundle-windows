@@ -3,9 +3,9 @@
 // Embeds the Tor core in-process (via go-libtor, cgo) - no subprocess for
 // Tor itself. Exposes a local SOCKS5 proxy and a persistent Hidden Service
 // that forwards to a local address you configure. Optionally uses obfs4/
-// webtunnel (lyrebird) or snowflake bridges if the network blocks Tor
-// directly - the transport binaries are embedded in this exe and only
-// extracted to disk if bridges are actually configured.
+// webtunnel (lyrebird) bridges if the network blocks Tor directly - the
+// transport binary is embedded in this exe and only extracted to disk if
+// bridges are actually configured.
 //
 // All working files (Tor's data directory, the onion service key, the
 // config file, and extracted transport binaries if needed) live in a
@@ -34,9 +34,6 @@ import (
 //go:embed embedded/lyrebird.exe
 var lyrebirdBin []byte
 
-//go:embed embedded/snowflake-client.exe
-var snowflakeBin []byte
-
 type bridgeLine = string
 
 type config struct {
@@ -49,7 +46,7 @@ type config struct {
 	// to try a direct connection only. Get bridge lines from Tor Browser's
 	// built-in bridge menu, https://bridges.torproject.org, or the
 	// @GetBridgesBot Telegram bot, then paste them here (one per line/entry)
-	// and restart. Supports obfs4/webtunnel (lyrebird) and snowflake lines.
+	// and restart. Supports obfs4/webtunnel (lyrebird) bridge lines.
 	Bridges []bridgeLine `json:"bridges"`
 }
 
@@ -102,31 +99,17 @@ func loadOrCreateOnionKey(path string) (ed25519.PrivateKey, error) {
 	return priv, nil
 }
 
-// extractTransports writes the embedded lyrebird/snowflake binaries to
-// binDir (only called when bridges are actually configured) and returns
-// their paths plus the ClientTransportPlugin lines to pass to tor.
-func extractTransports(binDir string) (lyrebirdPath, snowflakePath string, err error) {
+// extractTransports writes the embedded lyrebird binary to binDir (only
+// called when bridges are actually configured) and returns its path.
+func extractTransports(binDir string) (lyrebirdPath string, err error) {
 	if err = os.MkdirAll(binDir, 0700); err != nil {
-		return "", "", err
+		return "", err
 	}
 	lyrebirdPath = filepath.Join(binDir, "lyrebird.exe")
-	snowflakePath = filepath.Join(binDir, "snowflake-client.exe")
 	if err = os.WriteFile(lyrebirdPath, lyrebirdBin, 0755); err != nil {
-		return "", "", err
+		return "", err
 	}
-	if err = os.WriteFile(snowflakePath, snowflakeBin, 0755); err != nil {
-		return "", "", err
-	}
-	return lyrebirdPath, snowflakePath, nil
-}
-
-func usesSnowflake(bridges []bridgeLine) bool {
-	for _, b := range bridges {
-		if len(b) >= 9 && b[:9] == "snowflake" {
-			return true
-		}
-	}
-	return false
+	return lyrebirdPath, nil
 }
 
 func proxyConn(a net.Conn, forwardTo string) {
@@ -168,16 +151,13 @@ func main() {
 	usingBridges := len(cfg.Bridges) > 0
 	if usingBridges {
 		log.Printf("config has %d bridge line(s) configured - starting with bridges from the start", len(cfg.Bridges))
-		lyrebirdPath, snowflakePath, err := extractTransports(filepath.Join(base, "bin"))
+		lyrebirdPath, err := extractTransports(filepath.Join(base, "bin"))
 		if err != nil {
 			log.Fatalf("extracting transport binaries: %v", err)
 		}
 		args := []string{
 			"--ClientTransportPlugin", "obfs4,webtunnel exec " + lyrebirdPath,
 			"--UseBridges", "1",
-		}
-		if usesSnowflake(cfg.Bridges) {
-			args = append(args, "--ClientTransportPlugin", "snowflake exec "+snowflakePath)
 		}
 		for _, b := range cfg.Bridges {
 			args = append(args, "--Bridge", b)
