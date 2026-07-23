@@ -218,6 +218,12 @@ func main() {
 	fmt.Printf("Forwarding to: %s\n", cfg.ForwardTo)
 	fmt.Println("========================================")
 
+	addrFile := filepath.Join(base, "onion-address.txt")
+	addrText := fmt.Sprintf("%s.onion:%d\n", onion.ID, cfg.OnionPort)
+	if err := os.WriteFile(addrFile, []byte(addrText), 0644); err != nil {
+		log.Printf("warning: could not save address to %s: %v", addrFile, err)
+	}
+
 	for {
 		conn, err := onion.Accept()
 		if err != nil {
