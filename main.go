@@ -1,19 +1,17 @@
 // tor-bundle-windows: single-binary Windows Tor bundle.
 //
 // Embeds the Tor core in-process (via go-libtor, cgo) - no subprocess for
-// Tor itself. Exposes a local SOCKS5 proxy and a persistent Hidden Service
-// that forwards to a local address you configure. Optionally uses obfs4/
-// webtunnel (lyrebird) bridges if the network blocks Tor directly - the
-// transport binary is embedded in this exe and only extracted to disk if
-// bridges are actually configured.
+// Tor itself. Exposes a local unified SOCKS5+HTTP(CONNECT) proxy and one or
+// more Hidden Service port mappings under a single persistent .onion
+// address. Optionally uses obfs4/webtunnel (lyrebird) bridges if the
+// network blocks Tor directly.
 //
-// All working files (Tor's data directory, the onion service key, the
-// config file, and extracted transport binaries if needed) live in a
-// "tor-data" folder right next to this executable - nothing is written to
-// AppData, Temp, or any other hidden location.
+// All working files live in a "slake" folder right next to this
+// executable - nothing is written to AppData, Temp, or any hidden location.
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -25,6 +23,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cretz/bine/tor"
@@ -36,18 +36,30 @@ var lyrebirdBin []byte
 
 type bridgeLine = string
 
-type config struct {
-	// Local address that incoming onion connections get forwarded to.
-	// Example: "127.0.0.1:22" for SSH, "127.0.0.1:8080" for a web panel.
+type onionMapping struct {
+	OnionPort int    `json:"onion_port"`
 	ForwardTo string `json:"forward_to"`
-	// Virtual port the .onion address listens on (what people connect to).
-	OnionPort int `json:"onion_port"`
+}
+
+type config struct {
+	// "127.0.0.1" for local-only access, "0.0.0.0" to allow other devices
+	// on the network to use the proxy too.
+	ListenAddress string `json:"listen_address"`
+	// Single local port serving both SOCKS5 and HTTP(CONNECT) proxy -
+	// the protocol is auto-detected per connection.
+	ProxyPort int `json:"proxy_port"`
+	// One or more onion_port -> forward_to mappings, all under the same
+	// .onion address (one persistent key for the whole program).
+	OnionServices []onionMapping `json:"onion_services"`
 	// Bridge lines to use if the network blocks Tor directly. Leave empty
 	// to try a direct connection only. Get bridge lines from Tor Browser's
 	// built-in bridge menu, https://bridges.torproject.org, or the
-	// @GetBridgesBot Telegram bot, then paste them here (one per line/entry)
-	// and restart. Supports obfs4/webtunnel (lyrebird) bridge lines.
+	// @GetBridgesBot Telegram bot, then paste them here and restart.
 	Bridges []bridgeLine `json:"bridges"`
+
+	// Deprecated single-service fields, only read to migrate old configs.
+	LegacyForwardTo string `json:"forward_to,omitempty"`
+	LegacyOnionPort int    `json:"onion_port,omitempty"`
 }
 
 func exeDir() string {
@@ -62,6 +74,26 @@ func exeDir() string {
 	return dir
 }
 
+// migrateOldFolder renames a previous "tor-data" working folder to the new
+// name, if present, so an existing onion key (and address) isn't orphaned.
+func migrateOldFolder(newBase string) {
+	oldBase := filepath.Join(filepath.Dir(newBase), "tor-data")
+	if oldBase == newBase {
+		return
+	}
+	if _, err := os.Stat(newBase); err == nil {
+		return
+	}
+	if _, err := os.Stat(oldBase); err != nil {
+		return
+	}
+	if err := os.Rename(oldBase, newBase); err != nil {
+		log.Printf("could not rename old tor-data folder to slake: %v", err)
+		return
+	}
+	log.Println("renamed tor-data folder to slake (kept your existing onion key/address)")
+}
+
 func loadOrCreateConfig(path string) (*config, error) {
 	b, err := os.ReadFile(path)
 	if err == nil {
@@ -69,17 +101,46 @@ func loadOrCreateConfig(path string) (*config, error) {
 		if err := json.Unmarshal(b, &c); err != nil {
 			return nil, fmt.Errorf("parsing %s: %w", path, err)
 		}
+		changed := false
+		if len(c.OnionServices) == 0 && c.LegacyForwardTo != "" {
+			c.OnionServices = []onionMapping{{OnionPort: c.LegacyOnionPort, ForwardTo: c.LegacyForwardTo}}
+			changed = true
+		}
+		if c.LegacyForwardTo != "" || c.LegacyOnionPort != 0 {
+			c.LegacyForwardTo = ""
+			c.LegacyOnionPort = 0
+			changed = true
+		}
+		if c.ListenAddress == "" {
+			c.ListenAddress = "127.0.0.1"
+			changed = true
+		}
+		if c.ProxyPort == 0 {
+			c.ProxyPort = 9050
+			changed = true
+		}
+		if changed {
+			nb, _ := json.MarshalIndent(&c, "", "  ")
+			if err := os.WriteFile(path, nb, 0644); err == nil {
+				log.Printf("updated %s to the current config format", path)
+			}
+		}
 		return &c, nil
 	}
 	if !os.IsNotExist(err) {
 		return nil, err
 	}
-	c := &config{ForwardTo: "127.0.0.1:22", OnionPort: 22, Bridges: []bridgeLine{}}
+	c := &config{
+		ListenAddress: "127.0.0.1",
+		ProxyPort:     9050,
+		OnionServices: []onionMapping{{OnionPort: 22, ForwardTo: "127.0.0.1:22"}},
+		Bridges:       []bridgeLine{},
+	}
 	b, _ = json.MarshalIndent(c, "", "  ")
 	if err := os.WriteFile(path, b, 0644); err != nil {
 		return nil, err
 	}
-	log.Printf("wrote default config to %s - edit it (forward_to, onion_port, bridges) and restart if needed", path)
+	log.Printf("wrote default config to %s - edit it and restart if needed", path)
 	return c, nil
 }
 
@@ -99,17 +160,24 @@ func loadOrCreateOnionKey(path string) (ed25519.PrivateKey, error) {
 	return priv, nil
 }
 
-// extractTransports writes the embedded lyrebird binary to binDir (only
-// called when bridges are actually configured) and returns its path.
-func extractTransports(binDir string) (lyrebirdPath string, err error) {
-	if err = os.MkdirAll(binDir, 0700); err != nil {
+func extractLyrebird(binDir string) (string, error) {
+	if err := os.MkdirAll(binDir, 0700); err != nil {
 		return "", err
 	}
-	lyrebirdPath = filepath.Join(binDir, "lyrebird.exe")
-	if err = os.WriteFile(lyrebirdPath, lyrebirdBin, 0755); err != nil {
+	p := filepath.Join(binDir, "lyrebird.exe")
+	if err := os.WriteFile(p, lyrebirdBin, 0755); err != nil {
 		return "", err
 	}
-	return lyrebirdPath, nil
+	return p, nil
+}
+
+func pipeConns(a, b net.Conn) {
+	defer a.Close()
+	defer b.Close()
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(a, b); done <- struct{}{} }()
+	go func() { io.Copy(b, a); done <- struct{}{} }()
+	<-done
 }
 
 func proxyConn(a net.Conn, forwardTo string) {
@@ -119,15 +187,139 @@ func proxyConn(a net.Conn, forwardTo string) {
 		log.Printf("could not reach forward target %s: %v", forwardTo, err)
 		return
 	}
-	defer b.Close()
-	done := make(chan struct{}, 2)
-	go func() { io.Copy(a, b); done <- struct{}{} }()
-	go func() { io.Copy(b, a); done <- struct{}{} }()
-	<-done
+	pipeConns(a, b)
+}
+
+type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+func handleSocks5(conn net.Conn, br *bufio.Reader, dial dialFunc) {
+	hdr := make([]byte, 2)
+	if _, err := io.ReadFull(br, hdr); err != nil {
+		return
+	}
+	methods := make([]byte, int(hdr[1]))
+	if _, err := io.ReadFull(br, methods); err != nil {
+		return
+	}
+	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil { // no auth required
+		return
+	}
+	reqHdr := make([]byte, 4)
+	if _, err := io.ReadFull(br, reqHdr); err != nil {
+		return
+	}
+	if reqHdr[1] != 0x01 { // only CONNECT supported
+		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	var host string
+	switch reqHdr[3] {
+	case 0x01:
+		addr := make([]byte, 4)
+		if _, err := io.ReadFull(br, addr); err != nil {
+			return
+		}
+		host = net.IP(addr).String()
+	case 0x03:
+		lb := make([]byte, 1)
+		if _, err := io.ReadFull(br, lb); err != nil {
+			return
+		}
+		nameBytes := make([]byte, lb[0])
+		if _, err := io.ReadFull(br, nameBytes); err != nil {
+			return
+		}
+		host = string(nameBytes)
+	case 0x04:
+		addr := make([]byte, 16)
+		if _, err := io.ReadFull(br, addr); err != nil {
+			return
+		}
+		host = net.IP(addr).String()
+	default:
+		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	portBytes := make([]byte, 2)
+	if _, err := io.ReadFull(br, portBytes); err != nil {
+		return
+	}
+	port := int(portBytes[0])<<8 | int(portBytes[1])
+	target := net.JoinHostPort(host, strconv.Itoa(port))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	remote, err := dial(ctx, "tcp", target)
+	if err != nil {
+		conn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	pipeConns(conn, remote)
+}
+
+func handleHTTPConnect(conn net.Conn, br *bufio.Reader, dial dialFunc) {
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return
+	}
+	parts := strings.Fields(line)
+	if len(parts) < 2 || !strings.EqualFold(parts[0], "CONNECT") {
+		conn.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\n\r\n"))
+		return
+	}
+	target := parts[1]
+	for {
+		l, err := br.ReadString('\n')
+		if err != nil || l == "\r\n" || l == "\n" {
+			break
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	remote, err := dial(ctx, "tcp", target)
+	if err != nil {
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+	conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	pipeConns(conn, remote)
+}
+
+func startProxy(listenAddr string, dial dialFunc) error {
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return err
+	}
+	log.Printf("SOCKS5 + HTTP(CONNECT) proxy listening on %s", listenAddr)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				log.Printf("proxy accept error: %v", err)
+				return
+			}
+			go func() {
+				defer conn.Close()
+				br := bufio.NewReader(conn)
+				first, err := br.Peek(1)
+				if err != nil {
+					return
+				}
+				if first[0] == 0x05 {
+					handleSocks5(conn, br, dial)
+				} else {
+					handleHTTPConnect(conn, br, dial)
+				}
+			}()
+		}
+	}()
+	return nil
 }
 
 func main() {
-	base := filepath.Join(exeDir(), "tor-data")
+	base := filepath.Join(exeDir(), "slake")
+	migrateOldFolder(base)
 	if err := os.MkdirAll(base, 0700); err != nil {
 		log.Fatalf("cannot create data folder %s: %v", base, err)
 	}
@@ -151,9 +343,9 @@ func main() {
 	usingBridges := len(cfg.Bridges) > 0
 	if usingBridges {
 		log.Printf("config has %d bridge line(s) configured - starting with bridges from the start", len(cfg.Bridges))
-		lyrebirdPath, err := extractTransports(filepath.Join(base, "bin"))
+		lyrebirdPath, err := extractLyrebird(filepath.Join(base, "bin"))
 		if err != nil {
-			log.Fatalf("extracting transport binaries: %v", err)
+			log.Fatalf("extracting transport binary: %v", err)
 		}
 		args := []string{
 			"--ClientTransportPlugin", "obfs4,webtunnel exec " + lyrebirdPath,
@@ -195,7 +387,7 @@ func main() {
 			log.Fatalf("could not bootstrap even with the configured bridges: %v", err)
 		}
 		log.Println("could not connect directly - the network may be blocking Tor.")
-		log.Println("To use bridges: open tor-data/config.json, get bridge lines from")
+		log.Println("To use bridges: open slake/config.json, get bridge lines from")
 		log.Println("Tor Browser's built-in bridge menu, https://bridges.torproject.org,")
 		log.Println("or the @GetBridgesBot Telegram bot, paste them into \"bridges\", and")
 		log.Println("restart this program.")
@@ -203,33 +395,47 @@ func main() {
 	}
 	log.Println("Tor bootstrapped, network reachable.")
 
-	onion, err := t.Listen(bootCtx, &tor.ListenConf{
-		Key:         key,
-		Version3:    true,
-		RemotePorts: []int{cfg.OnionPort},
-	})
-	if err != nil {
-		log.Fatalf("failed to create hidden service: %v", err)
+	if err := startProxy(net.JoinHostPort(cfg.ListenAddress, strconv.Itoa(cfg.ProxyPort)), dialer.DialContext); err != nil {
+		log.Printf("warning: could not start proxy on %s:%d: %v", cfg.ListenAddress, cfg.ProxyPort, err)
 	}
-	defer onion.Close()
+
+	if len(cfg.OnionServices) == 0 {
+		log.Println("no onion_services configured - only the local proxy is active.")
+		select {}
+	}
+
+	var addrLines []string
+	for _, svc := range cfg.OnionServices {
+		onion, err := t.Listen(bootCtx, &tor.ListenConf{
+			Key:         key,
+			Version3:    true,
+			RemotePorts: []int{svc.OnionPort},
+		})
+		if err != nil {
+			log.Fatalf("failed to create hidden service on port %d: %v", svc.OnionPort, err)
+		}
+		defer onion.Close()
+
+		line := fmt.Sprintf("%s.onion:%d -> %s", onion.ID, svc.OnionPort, svc.ForwardTo)
+		addrLines = append(addrLines, line)
+		fmt.Println(line)
+
+		go func(l net.Listener, forwardTo string) {
+			for {
+				conn, err := l.Accept()
+				if err != nil {
+					return
+				}
+				go proxyConn(conn, forwardTo)
+			}
+		}(onion, svc.ForwardTo)
+	}
 
 	fmt.Println("========================================")
-	fmt.Printf("Onion address: %s.onion:%d\n", onion.ID, cfg.OnionPort)
-	fmt.Printf("Forwarding to: %s\n", cfg.ForwardTo)
-	fmt.Println("========================================")
-
 	addrFile := filepath.Join(base, "onion-address.txt")
-	addrText := fmt.Sprintf("%s.onion:%d\n", onion.ID, cfg.OnionPort)
-	if err := os.WriteFile(addrFile, []byte(addrText), 0644); err != nil {
+	if err := os.WriteFile(addrFile, []byte(strings.Join(addrLines, "\n")+"\n"), 0644); err != nil {
 		log.Printf("warning: could not save address to %s: %v", addrFile, err)
 	}
 
-	for {
-		conn, err := onion.Accept()
-		if err != nil {
-			log.Printf("accept error: %v", err)
-			return
-		}
-		go proxyConn(conn, cfg.ForwardTo)
-	}
+	select {}
 }
