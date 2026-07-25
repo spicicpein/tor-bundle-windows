@@ -28,7 +28,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cretz/bine/control"
 	"github.com/cretz/bine/tor"
+	torutilEd25519 "github.com/cretz/bine/torutil/ed25519"
 	"github.com/gen2brain/go-libtor"
 	"github.com/kardianos/service"
 	"github.com/miekg/dns"
@@ -535,19 +537,35 @@ func runApp(ctx context.Context) {
 		return
 	}
 
-	var addrLines []string
-	for _, svc := range cfg.OnionServices {
-		onion, err := t.Listen(bootCtx, &tor.ListenConf{
-			Key:         key,
-			Version3:    true,
-			RemotePorts: []int{svc.OnionPort},
-		})
-		if err != nil {
-			log.Fatalf("failed to create hidden service on port %d: %v", svc.OnionPort, err)
-		}
-		defer onion.Close()
+	kp := torutilEd25519.FromCryptoPrivateKey(key)
 
-		line := fmt.Sprintf("%s.onion:%d -> %s", onion.ID, svc.OnionPort, svc.ForwardTo)
+	var ports []*control.KeyVal
+	var listeners []net.Listener
+	for _, svc := range cfg.OnionServices {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			log.Fatalf("failed to open local listener for onion port %d: %v", svc.OnionPort, err)
+		}
+		localPort := ln.Addr().(*net.TCPAddr).Port
+		ports = append(ports, &control.KeyVal{
+			Key: strconv.Itoa(svc.OnionPort),
+			Val: fmt.Sprintf("127.0.0.1:%d", localPort),
+		})
+		listeners = append(listeners, ln)
+	}
+
+	resp, err := t.Control.AddOnion(&control.AddOnionRequest{
+		Key:   &control.ED25519Key{KeyPair: kp},
+		Ports: ports,
+	})
+	if err != nil {
+		log.Fatalf("failed to create hidden service: %v", err)
+	}
+
+	var addrLines []string
+	for i, svc := range cfg.OnionServices {
+		defer listeners[i].Close()
+		line := fmt.Sprintf("%s.onion:%d -> %s", resp.ServiceID, svc.OnionPort, svc.ForwardTo)
 		addrLines = append(addrLines, line)
 		fmt.Println(line)
 
@@ -559,7 +577,7 @@ func runApp(ctx context.Context) {
 				}
 				go proxyConn(conn, forwardTo)
 			}
-		}(onion, svc.ForwardTo)
+		}(listeners[i], svc.ForwardTo)
 	}
 
 	fmt.Println("========================================")
