@@ -17,6 +17,7 @@ import (
 	"crypto/rand"
 	_ "embed"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -29,6 +30,7 @@ import (
 
 	"github.com/cretz/bine/tor"
 	"github.com/gen2brain/go-libtor"
+	"github.com/kardianos/service"
 	"github.com/miekg/dns"
 )
 
@@ -439,7 +441,7 @@ func startDNS(cfg dnsConfig, socksAddr string) {
 	log.Println("DNS: both 0.0.0.0:53 and 127.0.0.1:53 are taken - embedded DNS server disabled, everything else still works")
 }
 
-func main() {
+func runApp(ctx context.Context) {
 	base := filepath.Join(exeDir(), "slake")
 	migrateOldFolder(base)
 	if err := os.MkdirAll(base, 0700); err != nil {
@@ -490,12 +492,13 @@ func main() {
 		log.Fatalf("failed to start tor: %v", err)
 	}
 	defer t.Close()
+	go func() { <-ctx.Done(); t.Close() }()
 
 	timeout := 5 * time.Minute
 	if !usingBridges {
 		timeout = 90 * time.Second
 	}
-	bootCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	bootCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	dialer, err := t.Dialer(bootCtx, nil)
@@ -528,7 +531,8 @@ func main() {
 
 	if len(cfg.OnionServices) == 0 {
 		log.Println("no onion_services configured - only the local proxy is active.")
-		select {}
+		<-ctx.Done()
+		return
 	}
 
 	var addrLines []string
@@ -564,5 +568,57 @@ func main() {
 		log.Printf("warning: could not save address to %s: %v", addrFile, err)
 	}
 
-	select {}
+	<-ctx.Done()
+}
+
+type program struct {
+	cancel context.CancelFunc
+}
+
+func (p *program) Start(s service.Service) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	p.cancel = cancel
+	go runApp(ctx)
+	return nil
+}
+
+func (p *program) Stop(s service.Service) error {
+	if p.cancel != nil {
+		p.cancel()
+	}
+	return nil
+}
+
+func main() {
+	var svcAction, svcName, svcDesc string
+	flag.StringVar(&svcAction, "service", "", "manage the Windows service: install, uninstall, start, stop, restart")
+	flag.StringVar(&svcName, "service-name", "TorBundleWindows", "service name (used with -service install)")
+	flag.StringVar(&svcDesc, "service-description", "Embedded Tor: SOCKS5/HTTP proxy, hidden service, DNS", "service description (used with -service install)")
+	flag.Parse()
+
+	svcConfig := &service.Config{
+		Name:        svcName,
+		DisplayName: svcName,
+		Description: svcDesc,
+		// Executable left empty on purpose: kardianos/service then uses the
+		// current executable's own path, whatever it's actually named.
+	}
+
+	prg := &program{}
+	s, err := service.New(prg, svcConfig)
+	if err != nil {
+		log.Fatalf("service setup: %v", err)
+	}
+
+	if svcAction != "" {
+		if err := service.Control(s, svcAction); err != nil {
+			log.Fatalf("service %s failed (try running as Administrator): %v", svcAction, err)
+		}
+		fmt.Printf("service %q: %s completed\n", svcName, svcAction)
+		return
+	}
+
+	if err := s.Run(); err != nil {
+		log.Fatalf("service run: %v", err)
+	}
 }

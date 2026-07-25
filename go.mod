@@ -25,6 +25,7 @@ replace golang.org/x/xerrors => github.com/golang/xerrors v0.0.0-20191204190536-
 require (
 	github.com/cretz/bine v0.2.0
 	github.com/gen2brain/go-libtor v1.2.0
+	github.com/kardianos/service v1.3.0
 	github.com/miekg/dns v1.1.72
 )
 
