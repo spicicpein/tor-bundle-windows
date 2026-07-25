@@ -9,11 +9,16 @@ github.com/golang/crypto v0.0.0-20220313003712-b769efc7c000 h1:P2ntH5N1RjQ2etu6c
 github.com/golang/crypto v0.0.0-20220313003712-b769efc7c000/go.mod h1:IxCIyHEi3zRg3s0A5j5BB6A9Jmi73HwBIUl50j+osU4=
 github.com/golang/net v0.0.0-20210525063256-abc453219eb5 h1:n0FYoXpDLvgTOX2W4Ul8vx3NdnUHAb7QXJySVGsoRf4=
 github.com/golang/net v0.0.0-20210525063256-abc453219eb5/go.mod h1:9nx3DQGgdP8bBQD5qxJ1jj9UTztislL4KSBs9R2vV5Y=
+github.com/golang/sync v0.0.0-20220722155255-886fb9371eb4 h1:3kCuaS8vB82qpoMmW+Qck/QHQYY/G4y2beDg3I++MGo=
+github.com/golang/sync v0.0.0-20220722155255-886fb9371eb4/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
 github.com/golang/sys v0.0.0-20220310020820-b874c991c1a5 h1:BJEhJHdNKl0UDOK9HTOhDHmPmAV3CvB+mfsh+OygQ/4=
 github.com/golang/sys v0.0.0-20220310020820-b874c991c1a5/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
 github.com/golang/term v0.0.0-20201126162022-7de9c90e9dd1/go.mod h1:bj7SfCRtBDWHUb9snDiAeCFNEtKQo2Wmx5Cou7ajbmo=
 github.com/golang/text v0.3.6/go.mod h1:5Zoc/QRtKVWzQhOtBMvqHzDpF6irO9z98xDceosuGiQ=
+github.com/golang/tools v0.0.0-20180917221912-90fa682c2a6e h1:YelrxyikJNMnFBUDMY0uB3hMsKR9kocb9fybHdJA7eY=
 github.com/golang/tools v0.0.0-20180917221912-90fa682c2a6e/go.mod h1:BZR6KJOI/IQ5FlSQroxL7yevEMRCz1dARTXHD9s4mHE=
+github.com/miekg/dns v1.1.72 h1:vhmr+TF2A3tuoGNkLDFK9zi36F2LS+hKTRW0Uf8kbzI=
+github.com/miekg/dns v1.1.72/go.mod h1:+EuEPhdHOsfk6Wk5TT2CzssZdqkmFhf8r+aVyDEToIs=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/spicicpein/go-libtor v1.2.1-0.20260722115239-91b74f56c2c3 h1:4FFAAODbEywRZE3A/KtrtAxrS2kBFormxjp0SAKIk8o=

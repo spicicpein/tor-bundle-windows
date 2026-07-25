@@ -1,6 +1,6 @@
 module tor-bundle-windows
 
-go 1.22.2
+go 1.24.4
 
 replace golang.org/x/crypto => github.com/golang/crypto v0.0.0-20220313003712-b769efc7c000
 
@@ -25,12 +25,16 @@ replace golang.org/x/xerrors => github.com/golang/xerrors v0.0.0-20191204190536-
 require (
 	github.com/cretz/bine v0.2.0
 	github.com/gen2brain/go-libtor v1.2.0
+	github.com/miekg/dns v1.1.72
 )
 
 require (
 	golang.org/x/crypto v0.0.0-20220313003712-b769efc7c000 // indirect
-	golang.org/x/net v0.0.0-20211112202133-69e39bad7dc2 // indirect
-	golang.org/x/sys v0.0.0-20220310020820-b874c991c1a5 // indirect
+	golang.org/x/net v0.48.0 // indirect
+	golang.org/x/sys v0.39.0 // indirect
+	golang.org/x/tools v0.40.0 // indirect
 )
 
 replace github.com/gen2brain/go-libtor => github.com/spicicpein/go-libtor v1.2.1-0.20260722115239-91b74f56c2c3
+
+replace golang.org/x/sync => github.com/golang/sync v0.0.0-20220722155255-886fb9371eb4

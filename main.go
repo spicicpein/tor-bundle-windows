@@ -29,6 +29,7 @@ import (
 
 	"github.com/cretz/bine/tor"
 	"github.com/gen2brain/go-libtor"
+	"github.com/miekg/dns"
 )
 
 //go:embed embedded/lyrebird.exe
@@ -57,9 +58,20 @@ type config struct {
 	// @GetBridgesBot Telegram bot, then paste them here and restart.
 	Bridges []bridgeLine `json:"bridges"`
 
+	DNS dnsConfig `json:"dns"`
+
 	// Deprecated single-service fields, only read to migrate old configs.
 	LegacyForwardTo string `json:"forward_to,omitempty"`
 	LegacyOnionPort int    `json:"onion_port,omitempty"`
+}
+
+type dnsConfig struct {
+	// Turns the embedded DNS server on/off. Off by default.
+	Enabled bool `json:"enabled"`
+	// If true, names are resolved through Tor (the resolution itself is
+	// hidden from your ISP/network). If false, the embedded server still
+	// runs but resolves normally, same as your OS would.
+	OverTor bool `json:"over_tor"`
 }
 
 func exeDir() string {
@@ -135,6 +147,7 @@ func loadOrCreateConfig(path string) (*config, error) {
 		ProxyPort:     9050,
 		OnionServices: []onionMapping{{OnionPort: 22, ForwardTo: "127.0.0.1:22"}},
 		Bridges:       []bridgeLine{},
+		DNS:           dnsConfig{Enabled: false, OverTor: true},
 	}
 	b, _ = json.MarshalIndent(c, "", "  ")
 	if err := os.WriteFile(path, b, 0644); err != nil {
@@ -317,6 +330,115 @@ func startProxy(listenAddr string, dial dialFunc) error {
 	return nil
 }
 
+func torResolve(socksAddr, hostname string) (net.IP, error) {
+	conn, err := net.DialTimeout("tcp", socksAddr, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		return nil, err
+	}
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return nil, err
+	}
+	if resp[0] != 0x05 || resp[1] != 0x00 {
+		return nil, fmt.Errorf("socks5 handshake with tor failed")
+	}
+	req := []byte{0x05, 0xF0, 0x00, 0x03, byte(len(hostname))} // 0xF0 = Tor's RESOLVE extension
+	req = append(req, []byte(hostname)...)
+	req = append(req, 0x00, 0x00)
+	if _, err := conn.Write(req); err != nil {
+		return nil, err
+	}
+	respHdr := make([]byte, 4)
+	if _, err := io.ReadFull(conn, respHdr); err != nil {
+		return nil, err
+	}
+	if respHdr[1] != 0x00 {
+		return nil, fmt.Errorf("tor resolve failed, reply code %d", respHdr[1])
+	}
+	var ip net.IP
+	switch respHdr[3] {
+	case 0x01:
+		b := make([]byte, 4)
+		if _, err := io.ReadFull(conn, b); err != nil {
+			return nil, err
+		}
+		ip = net.IP(b)
+	case 0x04:
+		b := make([]byte, 16)
+		if _, err := io.ReadFull(conn, b); err != nil {
+			return nil, err
+		}
+		ip = net.IP(b)
+	default:
+		return nil, fmt.Errorf("unexpected address type %d in resolve reply", respHdr[3])
+	}
+	io.ReadFull(conn, make([]byte, 2)) // trailing (unused) port field
+	return ip, nil
+}
+
+func startDNS(cfg dnsConfig, socksAddr string) {
+	if !cfg.Enabled {
+		return
+	}
+	handler := dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		for _, q := range r.Question {
+			if q.Qtype != dns.TypeA && q.Qtype != dns.TypeAAAA {
+				continue
+			}
+			name := strings.TrimSuffix(q.Name, ".")
+			var ip net.IP
+			var err error
+			if cfg.OverTor {
+				ip, err = torResolve(socksAddr, name)
+			} else {
+				var ips []net.IP
+				ips, err = net.LookupIP(name)
+				if err == nil && len(ips) > 0 {
+					ip = ips[0]
+				}
+			}
+			if err != nil || ip == nil {
+				continue
+			}
+			if q.Qtype == dns.TypeA && ip.To4() != nil {
+				m.Answer = append(m.Answer, &dns.A{
+					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+					A:   ip.To4(),
+				})
+			} else if q.Qtype == dns.TypeAAAA && ip.To4() == nil {
+				m.Answer = append(m.Answer, &dns.AAAA{
+					Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
+					AAAA: ip.To16(),
+				})
+			}
+		}
+		w.WriteMsg(m)
+	})
+
+	for _, addr := range []string{"0.0.0.0:53", "127.0.0.1:53"} {
+		pc, err := net.ListenPacket("udp", addr)
+		if err != nil {
+			log.Printf("DNS: %s unavailable (%v), trying next", addr, err)
+			continue
+		}
+		srv := &dns.Server{PacketConn: pc, Handler: handler}
+		go func(s *dns.Server, addr string) {
+			log.Printf("embedded DNS server listening on %s (over_tor=%v)", addr, cfg.OverTor)
+			if err := s.ActivateAndServe(); err != nil {
+				log.Printf("DNS server on %s stopped: %v", addr, err)
+			}
+		}(srv, addr)
+		return
+	}
+	log.Println("DNS: both 0.0.0.0:53 and 127.0.0.1:53 are taken - embedded DNS server disabled, everything else still works")
+}
+
 func main() {
 	base := filepath.Join(exeDir(), "slake")
 	migrateOldFolder(base)
@@ -334,12 +456,15 @@ func main() {
 		log.Fatalf("onion key: %v", err)
 	}
 
+	const internalSocksAddr = "127.0.0.1:19050"
+
 	startConf := &tor.StartConf{
 		ProcessCreator:    libtor.Creator,
 		DataDir:           filepath.Join(base, "state"),
 		RetainTempDataDir: true,
 	}
 
+	var args []string
 	usingBridges := len(cfg.Bridges) > 0
 	if usingBridges {
 		log.Printf("config has %d bridge line(s) configured - starting with bridges from the start", len(cfg.Bridges))
@@ -347,17 +472,17 @@ func main() {
 		if err != nil {
 			log.Fatalf("extracting transport binary: %v", err)
 		}
-		args := []string{
-			"--ClientTransportPlugin", "obfs4,webtunnel exec " + lyrebirdPath,
-			"--UseBridges", "1",
-		}
+		args = append(args, "--ClientTransportPlugin", "obfs4,webtunnel exec "+lyrebirdPath, "--UseBridges", "1")
 		for _, b := range cfg.Bridges {
 			args = append(args, "--Bridge", b)
 		}
-		startConf.ExtraArgs = args
 	} else {
 		log.Println("no bridges configured - trying a direct connection first")
 	}
+	if cfg.DNS.Enabled && cfg.DNS.OverTor {
+		args = append(args, "--SocksPort", internalSocksAddr)
+	}
+	startConf.ExtraArgs = args
 
 	log.Println("starting embedded Tor core (first run can take a while)...")
 	t, err := tor.Start(nil, startConf)
@@ -398,6 +523,8 @@ func main() {
 	if err := startProxy(net.JoinHostPort(cfg.ListenAddress, strconv.Itoa(cfg.ProxyPort)), dialer.DialContext); err != nil {
 		log.Printf("warning: could not start proxy on %s:%d: %v", cfg.ListenAddress, cfg.ProxyPort, err)
 	}
+
+	startDNS(cfg.DNS, internalSocksAddr)
 
 	if len(cfg.OnionServices) == 0 {
 		log.Println("no onion_services configured - only the local proxy is active.")
