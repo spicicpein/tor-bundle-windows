@@ -22,6 +22,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -62,11 +63,24 @@ type config struct {
 	// @GetBridgesBot Telegram bot, then paste them here and restart.
 	Bridges []bridgeLine `json:"bridges"`
 
+	// Optional: a URL of your own choosing (doesn't have to be GitHub, or
+	// anything specific) that serves a JSON file like
+	// {"updated":"...","bridges":["obfs4 ...", ...]}. If the network seems
+	// to be blocking Tor directly and no "bridges" are set above, this URL
+	// is fetched (over a plain, non-Tor connection) and used instead. Left
+	// empty, this feature is off. No specific address is hardcoded - you
+	// choose and control where this points.
+	BridgeSource bridgeSourceConfig `json:"bridge_source"`
+
 	DNS dnsConfig `json:"dns"`
 
 	// Deprecated single-service fields, only read to migrate old configs.
 	LegacyForwardTo string `json:"forward_to,omitempty"`
 	LegacyOnionPort int    `json:"onion_port,omitempty"`
+}
+
+type bridgeSourceConfig struct {
+	URL string `json:"url"`
 }
 
 type dnsConfig struct {
@@ -186,6 +200,85 @@ func extractLyrebird(binDir string) (string, error) {
 		return "", err
 	}
 	return p, nil
+}
+
+type bridgeFeed struct {
+	Updated string   `json:"updated"`
+	Bridges []string `json:"bridges"`
+}
+
+func validateBridgeLines(lines []string) []string {
+	var out []string
+	for _, l := range lines {
+		fields := strings.Fields(l)
+		if len(fields) < 3 {
+			continue
+		}
+		switch fields[0] {
+		case "obfs4", "webtunnel":
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// fetchBridges downloads and validates a bridge feed from an arbitrary,
+// user-chosen URL over a plain (non-Tor) HTTPS connection.
+func fetchBridges(url string) ([]string, string, error) {
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, "", fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, "", err
+	}
+	var feed bridgeFeed
+	if err := json.Unmarshal(body, &feed); err != nil {
+		return nil, "", fmt.Errorf("response is not the expected JSON shape: %w", err)
+	}
+	valid := validateBridgeLines(feed.Bridges)
+	if len(valid) == 0 {
+		return nil, "", fmt.Errorf("fetched feed has no valid-looking obfs4/webtunnel bridge lines")
+	}
+	return valid, feed.Updated, nil
+}
+
+// networkLooksBlocked does a quick, lightweight probe (no Tor involved) to
+// guess whether the network is blocking Tor before spending time on a full
+// bootstrap attempt.
+func networkLooksBlocked() bool {
+	conn, err := net.DialTimeout("tcp", "check.torproject.org:80", 10*time.Second)
+	if err != nil {
+		return true
+	}
+	conn.Close()
+	return false
+}
+
+// runCheckBridges is the -check-bridges CLI mode: verify a bridge_source URL
+// works, without starting Tor at all.
+func runCheckBridges(url string) {
+	if url == "" {
+		fmt.Println("no bridge_source.url set in the config - nothing to check")
+		return
+	}
+	fmt.Printf("fetching %s ...\n", url)
+	bridges, updated, err := fetchBridges(url)
+	if err != nil {
+		fmt.Printf("FAILED: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("OK: %d valid bridge line(s) found (feed updated: %s)\n", len(bridges), updated)
+	for _, b := range bridges {
+		fields := strings.Fields(b)
+		fmt.Printf("  - %s ...\n", fields[0])
+	}
 }
 
 func pipeConns(a, b net.Conn) {
@@ -470,15 +563,35 @@ func runApp(ctx context.Context) {
 	}
 
 	args := []string{"--SocksPort", internalSocksAddr}
-	usingBridges := len(cfg.Bridges) > 0
+	bridgeLines := cfg.Bridges
+	usingBridges := len(bridgeLines) > 0
+
+	if !usingBridges && cfg.BridgeSource.URL != "" {
+		log.Println("no bridges configured - checking whether the network looks blocked before trying...")
+		if networkLooksBlocked() {
+			log.Printf("direct connection looks blocked - fetching bridges from %s", cfg.BridgeSource.URL)
+			fetched, updated, err := fetchBridges(cfg.BridgeSource.URL)
+			if err != nil {
+				log.Printf("could not get bridges from bridge_source: %v", err)
+				log.Println("continuing without bridges - it will likely fail to bootstrap.")
+			} else {
+				log.Printf("got %d bridge(s) from bridge_source (feed updated: %s)", len(fetched), updated)
+				bridgeLines = fetched
+				usingBridges = true
+			}
+		} else {
+			log.Println("network looks reachable - trying a direct connection first")
+		}
+	}
+
 	if usingBridges {
-		log.Printf("config has %d bridge line(s) configured - starting with bridges from the start", len(cfg.Bridges))
+		log.Printf("starting with %d bridge line(s)", len(bridgeLines))
 		lyrebirdPath, err := extractLyrebird(filepath.Join(base, "bin"))
 		if err != nil {
 			log.Fatalf("extracting transport binary: %v", err)
 		}
 		args = append(args, "--ClientTransportPlugin", "obfs4,webtunnel exec "+lyrebirdPath, "--UseBridges", "1")
-		for _, b := range cfg.Bridges {
+		for _, b := range bridgeLines {
 			args = append(args, "--Bridge", b)
 		}
 	} else {
@@ -607,10 +720,24 @@ func (p *program) Stop(s service.Service) error {
 
 func main() {
 	var svcAction, svcName, svcDesc string
+	var checkBridges bool
 	flag.StringVar(&svcAction, "service", "", "manage the Windows service: install, uninstall, start, stop, restart")
 	flag.StringVar(&svcName, "service-name", "TorBundleWindows", "service name (used with -service install)")
 	flag.StringVar(&svcDesc, "service-description", "Embedded Tor: SOCKS5/HTTP proxy, hidden service, DNS", "service description (used with -service install)")
+	flag.BoolVar(&checkBridges, "check-bridges", false, "test the config's bridge_source.url and exit, without starting Tor")
 	flag.Parse()
+
+	if checkBridges {
+		base := filepath.Join(exeDir(), "slake")
+		migrateOldFolder(base)
+		os.MkdirAll(base, 0700)
+		cfg, err := loadOrCreateConfig(filepath.Join(base, "config.json"))
+		if err != nil {
+			log.Fatalf("config: %v", err)
+		}
+		runCheckBridges(cfg.BridgeSource.URL)
+		return
+	}
 
 	svcConfig := &service.Config{
 		Name:        svcName,
