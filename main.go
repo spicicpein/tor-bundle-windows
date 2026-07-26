@@ -80,7 +80,10 @@ type config struct {
 }
 
 type bridgeSourceConfig struct {
-	URL string `json:"url"`
+	// One or more of your own collector URLs, tried in order until one
+	// works. Having more than one means a single blocked/removed address
+	// doesn't take the whole feature down.
+	URLs []string `json:"urls"`
 }
 
 type dnsConfig struct {
@@ -263,21 +266,28 @@ func networkLooksBlocked() bool {
 
 // runCheckBridges is the -check-bridges CLI mode: verify a bridge_source URL
 // works, without starting Tor at all.
-func runCheckBridges(url string) {
-	if url == "" {
-		fmt.Println("no bridge_source.url set in the config - nothing to check")
+func runCheckBridges(urls []string) {
+	if len(urls) == 0 {
+		fmt.Println("no bridge_source.urls set in the config - nothing to check")
 		return
 	}
-	fmt.Printf("fetching %s ...\n", url)
-	bridges, updated, err := fetchBridges(url)
-	if err != nil {
-		fmt.Printf("FAILED: %v\n", err)
-		os.Exit(1)
+	anyOK := false
+	for _, url := range urls {
+		fmt.Printf("fetching %s ...\n", url)
+		bridges, updated, err := fetchBridges(url)
+		if err != nil {
+			fmt.Printf("  FAILED: %v\n", err)
+			continue
+		}
+		anyOK = true
+		fmt.Printf("  OK: %d valid bridge line(s) found (feed updated: %s)\n", len(bridges), updated)
+		for _, b := range bridges {
+			fields := strings.Fields(b)
+			fmt.Printf("    - %s ...\n", fields[0])
+		}
 	}
-	fmt.Printf("OK: %d valid bridge line(s) found (feed updated: %s)\n", len(bridges), updated)
-	for _, b := range bridges {
-		fields := strings.Fields(b)
-		fmt.Printf("  - %s ...\n", fields[0])
+	if !anyOK {
+		os.Exit(1)
 	}
 }
 
@@ -566,18 +576,23 @@ func runApp(ctx context.Context) {
 	bridgeLines := cfg.Bridges
 	usingBridges := len(bridgeLines) > 0
 
-	if !usingBridges && cfg.BridgeSource.URL != "" {
+	if !usingBridges && len(cfg.BridgeSource.URLs) > 0 {
 		log.Println("no bridges configured - checking whether the network looks blocked before trying...")
 		if networkLooksBlocked() {
-			log.Printf("direct connection looks blocked - fetching bridges from %s", cfg.BridgeSource.URL)
-			fetched, updated, err := fetchBridges(cfg.BridgeSource.URL)
-			if err != nil {
-				log.Printf("could not get bridges from bridge_source: %v", err)
-				log.Println("continuing without bridges - it will likely fail to bootstrap.")
-			} else {
-				log.Printf("got %d bridge(s) from bridge_source (feed updated: %s)", len(fetched), updated)
+			log.Println("direct connection looks blocked - trying bridge_source.urls in order...")
+			for _, url := range cfg.BridgeSource.URLs {
+				fetched, updated, err := fetchBridges(url)
+				if err != nil {
+					log.Printf("  %s: %v", url, err)
+					continue
+				}
+				log.Printf("  %s: got %d bridge(s) (feed updated: %s)", url, len(fetched), updated)
 				bridgeLines = fetched
 				usingBridges = true
+				break
+			}
+			if !usingBridges {
+				log.Println("none of the bridge_source.urls worked - continuing without bridges, it will likely fail to bootstrap.")
 			}
 		} else {
 			log.Println("network looks reachable - trying a direct connection first")
@@ -735,7 +750,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("config: %v", err)
 		}
-		runCheckBridges(cfg.BridgeSource.URL)
+		runCheckBridges(cfg.BridgeSource.URLs)
 		return
 	}
 
