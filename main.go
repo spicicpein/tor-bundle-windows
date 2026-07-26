@@ -466,9 +466,10 @@ func runApp(ctx context.Context) {
 		ProcessCreator:    libtor.Creator,
 		DataDir:           filepath.Join(base, "state"),
 		RetainTempDataDir: true,
+		NoAutoSocksPort:   true, // we set our own single SocksPort below instead
 	}
 
-	var args []string
+	args := []string{"--SocksPort", internalSocksAddr}
 	usingBridges := len(cfg.Bridges) > 0
 	if usingBridges {
 		log.Printf("config has %d bridge line(s) configured - starting with bridges from the start", len(cfg.Bridges))
@@ -482,9 +483,6 @@ func runApp(ctx context.Context) {
 		}
 	} else {
 		log.Println("no bridges configured - trying a direct connection first")
-	}
-	if cfg.DNS.Enabled && cfg.DNS.OverTor {
-		args = append(args, "--SocksPort", internalSocksAddr)
 	}
 	startConf.ExtraArgs = args
 
@@ -503,7 +501,7 @@ func runApp(ctx context.Context) {
 	bootCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	dialer, err := t.Dialer(bootCtx, nil)
+	dialer, err := t.Dialer(bootCtx, &tor.DialConf{ProxyAddress: internalSocksAddr})
 	if err == nil {
 		if conn, derr := dialer.DialContext(bootCtx, "tcp", "check.torproject.org:80"); derr == nil {
 			conn.Close()
