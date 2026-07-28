@@ -612,7 +612,12 @@ func runApp(ctx context.Context) {
 		if err != nil {
 			log.Fatalf("extracting transport binary: %v", err)
 		}
-		args = append(args, "--ClientTransportPlugin", "obfs4,webtunnel exec \""+lyrebirdPath+"\"", "--UseBridges", "1")
+		if shortPath, serr := toShortPath(lyrebirdPath); serr == nil {
+			lyrebirdPath = shortPath
+		} else {
+			log.Printf("warning: could not get short path for %s (%v) - if your folder path has spaces, bridges may fail to start", lyrebirdPath, serr)
+		}
+		args = append(args, "--ClientTransportPlugin", "obfs4,webtunnel exec "+lyrebirdPath, "--UseBridges", "1")
 		for _, b := range bridgeLines {
 			args = append(args, "--Bridge", b)
 		}
