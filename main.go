@@ -552,8 +552,15 @@ func runApp(ctx context.Context) {
 	if err := os.MkdirAll(base, 0700); err != nil {
 		log.Fatalf("cannot create data folder %s: %v", base, err)
 	}
+	log.Printf("working folder: %s", base)
 
-	cfg, err := loadOrCreateConfig(filepath.Join(base, "config.json"))
+	cfgPath := filepath.Join(base, "config.json")
+	if _, statErr := os.Stat(cfgPath); statErr != nil {
+		log.Printf("no existing config.json found at %s - will create a default one", cfgPath)
+	} else {
+		log.Printf("loading config from %s", cfgPath)
+	}
+	cfg, err := loadOrCreateConfig(cfgPath)
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
