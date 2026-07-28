@@ -612,7 +612,7 @@ func runApp(ctx context.Context) {
 		if err != nil {
 			log.Fatalf("extracting transport binary: %v", err)
 		}
-		args = append(args, "--ClientTransportPlugin", "obfs4,webtunnel exec "+lyrebirdPath, "--UseBridges", "1")
+		args = append(args, "--ClientTransportPlugin", "obfs4,webtunnel exec \""+lyrebirdPath+"\"", "--UseBridges", "1")
 		for _, b := range bridgeLines {
 			args = append(args, "--Bridge", b)
 		}
