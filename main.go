@@ -634,9 +634,13 @@ func runApp(ctx context.Context) {
 	defer t.Close()
 	go func() { <-ctx.Done(); t.Close() }()
 
-	timeout := 5 * time.Minute
-	if !usingBridges {
-		timeout = 90 * time.Second
+	timeout := 90 * time.Second
+	if usingBridges {
+		timeout = time.Duration(len(bridgeLines)) * 2 * time.Minute
+		if timeout < 5*time.Minute {
+			timeout = 5 * time.Minute
+		}
+		log.Printf("with %d bridge(s) configured, giving Tor up to %s to work through them", len(bridgeLines), timeout)
 	}
 	bootCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
