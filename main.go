@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -74,9 +75,22 @@ type config struct {
 
 	DNS dnsConfig `json:"dns"`
 
+	// While running with bridges, periodically checks that Tor can still
+	// actually reach the network. If it stops working (bridges "died"),
+	// runs an external command/script once - do whatever you want there
+	// (email, Telegram bot, Windows notification, etc.) - this program
+	// doesn't send notifications itself.
+	BridgeHealthCheck bridgeHealthCheckConfig `json:"bridge_health_check"`
+
 	// Deprecated single-service fields, only read to migrate old configs.
 	LegacyForwardTo string `json:"forward_to,omitempty"`
 	LegacyOnionPort int    `json:"onion_port,omitempty"`
+}
+
+type bridgeHealthCheckConfig struct {
+	Enabled         bool   `json:"enabled"`
+	IntervalMinutes int    `json:"interval_minutes"`
+	OnDead          string `json:"on_dead"`
 }
 
 type bridgeSourceConfig struct {
@@ -152,6 +166,10 @@ func loadOrCreateConfig(path string) (*config, error) {
 			c.ProxyPort = 9050
 			changed = true
 		}
+		if c.BridgeHealthCheck.IntervalMinutes == 0 {
+			c.BridgeHealthCheck.IntervalMinutes = 30
+			changed = true
+		}
 		if changed {
 			nb, _ := json.MarshalIndent(&c, "", "  ")
 			if err := os.WriteFile(path, nb, 0644); err == nil {
@@ -169,6 +187,11 @@ func loadOrCreateConfig(path string) (*config, error) {
 		OnionServices: []onionMapping{{OnionPort: 22, ForwardTo: "127.0.0.1:22"}},
 		Bridges:       []bridgeLine{},
 		DNS:           dnsConfig{Enabled: false, OverTor: true},
+		BridgeHealthCheck: bridgeHealthCheckConfig{
+			Enabled:         false,
+			IntervalMinutes: 30,
+			OnDead:          "",
+		},
 	}
 	b, _ = json.MarshalIndent(c, "", "  ")
 	if err := os.WriteFile(path, b, 0644); err != nil {
@@ -255,6 +278,69 @@ func fetchBridges(url string) ([]string, string, error) {
 // networkLooksBlocked does a quick, lightweight probe (no Tor involved) to
 // guess whether the network is blocking Tor before spending time on a full
 // bootstrap attempt.
+// runBridgeHealthCheck periodically verifies Tor can still reach the
+// network while running with bridges, and runs an external command once
+// when it transitions from working to not working (edge-triggered, so it
+// doesn't spam the command on every failed check while still dead).
+func runBridgeHealthCheck(ctx context.Context, cfg bridgeHealthCheckConfig, dial dialFunc) {
+	if !cfg.Enabled {
+		return
+	}
+	interval := time.Duration(cfg.IntervalMinutes) * time.Minute
+	if interval <= 0 {
+		interval = 30 * time.Minute
+	}
+	log.Printf("bridge health check enabled: checking every %s", interval)
+
+	consecutiveFailures := 0
+	wasDead := false
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			conn, err := dial(checkCtx, "tcp", "check.torproject.org:80")
+			cancel()
+			if err == nil {
+				conn.Close()
+				if wasDead {
+					log.Println("bridge health check: connection recovered")
+				}
+				consecutiveFailures = 0
+				wasDead = false
+				continue
+			}
+			consecutiveFailures++
+			log.Printf("bridge health check failed (%d in a row): %v", consecutiveFailures, err)
+			if consecutiveFailures >= 2 && !wasDead {
+				wasDead = true
+				if cfg.OnDead != "" {
+					log.Printf("bridges appear dead - running on_dead command: %s", cfg.OnDead)
+					runExternalCommand(cfg.OnDead)
+				} else {
+					log.Println("bridges appear dead - no on_dead command configured")
+				}
+			}
+		}
+	}
+}
+
+func runExternalCommand(cmdline string) {
+	cmd := exec.Command("cmd", "/C", cmdline)
+	if err := cmd.Start(); err != nil {
+		log.Printf("failed to start on_dead command: %v", err)
+		return
+	}
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			log.Printf("on_dead command exited with error: %v", err)
+		}
+	}()
+}
+
 func networkLooksBlocked() bool {
 	conn, err := net.DialTimeout("tcp", "check.torproject.org:80", 10*time.Second)
 	if err != nil {
@@ -266,6 +352,76 @@ func networkLooksBlocked() bool {
 
 // runCheckBridges is the -check-bridges CLI mode: verify a bridge_source URL
 // works, without starting Tor at all.
+// runTestBridges tests each bridge line individually: starts the embedded
+// Tor core with just that one bridge, tries to bootstrap, then closes it
+// before moving to the next. Note: repeatedly starting/stopping the
+// embedded core within one process run is not something used elsewhere in
+// this program (the normal run path starts it exactly once) - if this
+// behaves oddly, that's the first thing to suspect.
+func runTestBridges(lines []bridgeLine, onDead string) {
+	if len(lines) == 0 {
+		fmt.Println("no bridges to test (empty config.json bridges, or empty -bridges-file)")
+		return
+	}
+
+	base := filepath.Join(exeDir(), "slake")
+	migrateOldFolder(base)
+	os.MkdirAll(base, 0700)
+	lyrebirdPath, err := extractLyrebird(filepath.Join(base, "bin"))
+	if err != nil {
+		log.Fatalf("extracting transport binary: %v", err)
+	}
+	if shortPath, serr := toShortPath(lyrebirdPath); serr == nil {
+		lyrebirdPath = shortPath
+	}
+
+	aliveCount := 0
+	for i, b := range lines {
+		fmt.Printf("[%d/%d] testing: %s\n", i+1, len(lines), strings.Fields(b)[0]+" "+strings.Fields(b)[1])
+		testDir := filepath.Join(base, "test-state")
+		os.RemoveAll(testDir) // fresh state per bridge, avoid cross-contamination
+		startConf := &tor.StartConf{
+			ProcessCreator: libtor.Creator,
+			DataDir:        testDir,
+			ExtraArgs: []string{
+				"--SocksPort", "127.0.0.1:19051",
+				"--ClientTransportPlugin", "obfs4,webtunnel exec " + lyrebirdPath,
+				"--UseBridges", "1",
+				"--Bridge", b,
+			},
+		}
+		t, err := tor.Start(nil, startConf)
+		if err != nil {
+			fmt.Printf("    FAILED to start: %v\n", err)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		dialer, derr := t.Dialer(ctx, &tor.DialConf{ProxyAddress: "127.0.0.1:19051"})
+		ok := false
+		if derr == nil {
+			if conn, cerr := dialer.DialContext(ctx, "tcp", "check.torproject.org:80"); cerr == nil {
+				conn.Close()
+				ok = true
+			}
+		}
+		cancel()
+		t.Close()
+		os.RemoveAll(testDir)
+		if ok {
+			fmt.Println("    OK")
+			aliveCount++
+		} else {
+			fmt.Println("    dead")
+		}
+	}
+
+	fmt.Printf("\n%d/%d bridge(s) working\n", aliveCount, len(lines))
+	if aliveCount == 0 && onDead != "" {
+		fmt.Printf("all bridges dead - running: %s\n", onDead)
+		runExternalCommand(onDead)
+	}
+}
+
 func runCheckBridges(urls []string) {
 	if len(urls) == 0 {
 		fmt.Println("no bridge_source.urls set in the config - nothing to check")
@@ -673,6 +829,10 @@ func runApp(ctx context.Context) {
 
 	startDNS(cfg.DNS, internalSocksAddr)
 
+	if usingBridges {
+		go runBridgeHealthCheck(ctx, cfg.BridgeHealthCheck, dialer.DialContext)
+	}
+
 	if len(cfg.OnionServices) == 0 {
 		log.Println("no onion_services configured - only the local proxy is active.")
 		<-ctx.Done()
@@ -752,10 +912,16 @@ func (p *program) Stop(s service.Service) error {
 func main() {
 	var svcAction, svcName, svcDesc string
 	var checkBridges bool
+	var testBridges bool
+	var bridgesFile string
+	var onDead string
 	flag.StringVar(&svcAction, "service", "", "manage the Windows service: install, uninstall, start, stop, restart")
 	flag.StringVar(&svcName, "service-name", "TorBundleWindows", "service name (used with -service install)")
 	flag.StringVar(&svcDesc, "service-description", "Embedded Tor: SOCKS5/HTTP proxy, hidden service, DNS", "service description (used with -service install)")
 	flag.BoolVar(&checkBridges, "check-bridges", false, "test the config's bridge_source.url and exit, without starting Tor")
+	flag.BoolVar(&testBridges, "test-bridges", false, "test each bridge line individually (from config.json, or -bridges-file) and exit")
+	flag.StringVar(&bridgesFile, "bridges-file", "", "with -test-bridges: test bridge lines from this file (one per line) instead of config.json")
+	flag.StringVar(&onDead, "on-dead", "", "with -test-bridges: command/script to run if every tested bridge fails")
 	flag.Parse()
 
 	if checkBridges {
@@ -767,6 +933,33 @@ func main() {
 			log.Fatalf("config: %v", err)
 		}
 		runCheckBridges(cfg.BridgeSource.URLs)
+		return
+	}
+
+	if testBridges {
+		var lines []bridgeLine
+		if bridgesFile != "" {
+			b, err := os.ReadFile(bridgesFile)
+			if err != nil {
+				log.Fatalf("reading %s: %v", bridgesFile, err)
+			}
+			for _, l := range strings.Split(string(b), "\n") {
+				l = strings.TrimSpace(l)
+				if l != "" {
+					lines = append(lines, l)
+				}
+			}
+		} else {
+			base := filepath.Join(exeDir(), "slake")
+			migrateOldFolder(base)
+			os.MkdirAll(base, 0700)
+			cfg, err := loadOrCreateConfig(filepath.Join(base, "config.json"))
+			if err != nil {
+				log.Fatalf("config: %v", err)
+			}
+			lines = cfg.Bridges
+		}
+		runTestBridges(lines, onDead)
 		return
 	}
 
