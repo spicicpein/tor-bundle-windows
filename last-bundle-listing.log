@@ -15,7 +15,7 @@ bundle-extract/data/geoip
 bundle-extract/data/torrc-defaults
 bundle-extract/data/geoip6
 total 17524
-drwxr-xr-x 2 runner runner     4096 Aug  5 19:27 .
-drwxr-xr-x 7 runner runner     4096 Aug  5 19:27 ..
--rw-r--r-- 1 runner runner        0 Aug  5 19:26 .gitkeep
--rwx------ 1 runner runner 17934336 Aug  5 19:27 lyrebird.exe
+drwxr-xr-x 2 runner runner     4096 Aug  5 19:31 .
+drwxr-xr-x 7 runner runner     4096 Aug  5 19:31 ..
+-rw-r--r-- 1 runner runner        0 Aug  5 19:31 .gitkeep
+-rwx------ 1 runner runner 17934336 Aug  5 19:31 lyrebird.exe
