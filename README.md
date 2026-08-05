@@ -33,7 +33,8 @@ Hidden Service, DNS через Tor, поддержка мостов — всё �
   ],
   "bridges": [],
   "bridge_source": { "urls": [] },
-  "dns": { "enabled": false, "over_tor": true }
+  "dns": { "enabled": false, "over_tor": true },
+  "bridge_health_check": { "enabled": false, "interval_minutes": 30, "on_dead": "" }
 }
 ```
 
@@ -45,9 +46,13 @@ Hidden Service, DNS через Tor, поддержка мостов — всё �
 | `bridges` | строки мостов, если сеть блокирует Tor напрямую — см. [HELP-bridges.txt](HELP-bridges.txt) |
 | `bridge_source.urls` | адрес(а) собственного сборщика мостов, автоматический фолбэк |
 | `dns.enabled` / `dns.over_tor` | встроенный DNS-сервер (порт 53) и резолвинг через Tor |
+| `bridge_health_check` | живой мониторинг мостов во время работы, с командой на случай "протухания" |
 
 Про мосты подробно, с примерами под каждый тип — в
-[HELP-bridges.txt](HELP-bridges.txt).
+[HELP-bridges.txt](HELP-bridges.txt). Полный эталонный конфиг со всеми
+полями и комментариями к каждому — в
+[config_full_example.json](config_full_example.json) (это справочный
+файл, не рабочий — обычный JSON не понимает комментарии).
 
 ## Служба Windows
 
@@ -67,6 +72,19 @@ tor-bundle-windows.exe -check-bridges
 ```
 
 Проверяет `bridge_source.urls`, ничего не запуская.
+
+## Тестирование мостов вручную
+
+```
+tor-bundle-windows.exe -test-bridges
+tor-bundle-windows.exe -test-bridges -bridges-file mylist.txt -on-dead notify.bat
+```
+
+Проверяет по очереди каждую строку из `bridges` (или из файла), реально
+пытаясь подключиться через каждую. Подробности и живой мониторинг во
+время работы (`bridge_health_check`) — в
+[HELP-bridges.txt](HELP-bridges.txt) и
+[config_full_example.json](config_full_example.json).
 
 ## Как это собрано
 
