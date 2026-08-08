@@ -82,9 +82,20 @@ type config struct {
 	// doesn't send notifications itself.
 	BridgeHealthCheck bridgeHealthCheckConfig `json:"bridge_health_check"`
 
+	// Route Tor's own connections through an upstream SOCKS5 proxy (e.g.
+	// a VPN or another proxy you already trust). Always used if set -
+	// this is NOT a dynamic fallback (that would need restarting the
+	// embedded core, which this program deliberately avoids). Empty
+	// address = not used.
+	UpstreamSocks5 upstreamSocks5Config `json:"upstream_socks5"`
+
 	// Deprecated single-service fields, only read to migrate old configs.
 	LegacyForwardTo string `json:"forward_to,omitempty"`
 	LegacyOnionPort int    `json:"onion_port,omitempty"`
+}
+
+type upstreamSocks5Config struct {
+	Address string `json:"address"`
 }
 
 type bridgeHealthCheckConfig struct {
@@ -736,6 +747,10 @@ func runApp(ctx context.Context) {
 	}
 
 	args := []string{"--SocksPort", internalSocksAddr}
+	if cfg.UpstreamSocks5.Address != "" {
+		log.Printf("routing through upstream SOCKS5 proxy: %s", cfg.UpstreamSocks5.Address)
+		args = append(args, "--Socks5Proxy", cfg.UpstreamSocks5.Address)
+	}
 	bridgeLines := cfg.Bridges
 	usingBridges := len(bridgeLines) > 0
 
@@ -790,36 +805,49 @@ func runApp(ctx context.Context) {
 	defer t.Close()
 	go func() { <-ctx.Done(); t.Close() }()
 
-	timeout := 90 * time.Second
+	perAttemptTimeout := 90 * time.Second
 	if usingBridges {
-		timeout = time.Duration(len(bridgeLines)) * 2 * time.Minute
-		if timeout < 5*time.Minute {
-			timeout = 5 * time.Minute
+		perAttemptTimeout = time.Duration(len(bridgeLines)) * 2 * time.Minute
+		if perAttemptTimeout < 5*time.Minute {
+			perAttemptTimeout = 5 * time.Minute
 		}
-		log.Printf("with %d bridge(s) configured, giving Tor up to %s to work through them", len(bridgeLines), timeout)
+		log.Printf("with %d bridge(s) configured, giving Tor up to %s per attempt", len(bridgeLines), perAttemptTimeout)
 	}
-	bootCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
-	dialer, err := t.Dialer(bootCtx, &tor.DialConf{ProxyAddress: internalSocksAddr})
-	if err == nil {
-		if conn, derr := dialer.DialContext(bootCtx, "tcp", "check.torproject.org:80"); derr == nil {
-			conn.Close()
-			err = nil
-		} else {
-			err = derr
-		}
-	}
+	dialer, err := t.Dialer(ctx, &tor.DialConf{ProxyAddress: internalSocksAddr})
 	if err != nil {
-		if usingBridges {
-			log.Fatalf("could not bootstrap even with the configured bridges: %v", err)
+		log.Fatalf("failed to create dialer: %v", err)
+	}
+
+	backoff := 1 * time.Minute
+	const maxBackoff = 30 * time.Minute
+	bootstrapped := false
+	for attempt := 1; !bootstrapped; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, perAttemptTimeout)
+		conn, derr := dialer.DialContext(attemptCtx, "tcp", "check.torproject.org:80")
+		cancel()
+		if derr == nil {
+			conn.Close()
+			bootstrapped = true
+			break
 		}
-		log.Println("could not connect directly - the network may be blocking Tor.")
-		log.Println("To use bridges: open slake/config.json, get bridge lines from")
-		log.Println("Tor Browser's built-in bridge menu, https://bridges.torproject.org,")
-		log.Println("or the @GetBridgesBot Telegram bot, paste them into \"bridges\", and")
-		log.Println("restart this program.")
-		log.Fatalf("bootstrap failed: %v", err)
+		if attempt == 1 && !usingBridges {
+			log.Println("could not connect directly - the network may be blocking Tor.")
+			log.Println("To use bridges: open slake/config.json, get bridge lines from")
+			log.Println("Tor Browser's built-in bridge menu, https://bridges.torproject.org,")
+			log.Println("or the @GetBridgesBot Telegram bot, paste them into \"bridges\", and")
+			log.Println("restart this program.")
+		}
+		log.Printf("bootstrap attempt %d failed (%v) - this could just mean no internet yet; retrying in %s", attempt, derr, backoff)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
 	}
 	log.Println("Tor bootstrapped, network reachable.")
 

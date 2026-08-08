@@ -34,7 +34,8 @@ Hidden Service, DNS через Tor, поддержка мостов — всё �
   "bridges": [],
   "bridge_source": { "urls": [] },
   "dns": { "enabled": false, "over_tor": true },
-  "bridge_health_check": { "enabled": false, "interval_minutes": 30, "on_dead": "" }
+  "bridge_health_check": { "enabled": false, "interval_minutes": 30, "on_dead": "" },
+  "upstream_socks5": { "address": "" }
 }
 ```
 
@@ -47,6 +48,7 @@ Hidden Service, DNS через Tor, поддержка мостов — всё �
 | `bridge_source.urls` | адрес(а) собственного сборщика мостов, автоматический фолбэк |
 | `dns.enabled` / `dns.over_tor` | встроенный DNS-сервер (порт 53) и резолвинг через Tor |
 | `bridge_health_check` | живой мониторинг мостов во время работы, с командой на случай "протухания" |
+| `upstream_socks5.address` | направить трафик Tor через вышестоящий SOCKS5 (всегда, не как фолбэк) |
 
 Про мосты подробно, с примерами под каждый тип — в
 [HELP-bridges.txt](HELP-bridges.txt). Полный эталонный конфиг со всеми
