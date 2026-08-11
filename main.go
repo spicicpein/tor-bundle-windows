@@ -286,9 +286,6 @@ func fetchBridges(url string) ([]string, string, error) {
 	return valid, feed.Updated, nil
 }
 
-// networkLooksBlocked does a quick, lightweight probe (no Tor involved) to
-// guess whether the network is blocking Tor before spending time on a full
-// bootstrap attempt.
 // runBridgeHealthCheck periodically verifies Tor can still reach the
 // network while running with bridges, and runs an external command once
 // when it transitions from working to not working (edge-triggered, so it
@@ -350,15 +347,6 @@ func runExternalCommand(cmdline string) {
 			log.Printf("on_dead command exited with error: %v", err)
 		}
 	}()
-}
-
-func networkLooksBlocked() bool {
-	conn, err := net.DialTimeout("tcp", "check.torproject.org:80", 10*time.Second)
-	if err != nil {
-		return true
-	}
-	conn.Close()
-	return false
 }
 
 // runCheckBridges is the -check-bridges CLI mode: verify a bridge_source URL
@@ -713,6 +701,121 @@ func startDNS(cfg dnsConfig, socksAddr string) {
 	log.Println("DNS: both 0.0.0.0:53 and 127.0.0.1:53 are taken - embedded DNS server disabled, everything else still works")
 }
 
+// bridgeTimeout scales the per-attempt timeout with how many bridges are
+// being tried, since Tor seems to pace attempts across multiple bridges
+// internally rather than trying them all at once.
+func bridgeTimeout(n int) time.Duration {
+	t := time.Duration(n) * 2 * time.Minute
+	if t < 5*time.Minute {
+		t = 5 * time.Minute
+	}
+	return t
+}
+
+// buildBridgeArgs extracts lyrebird (if not already done) and appends the
+// ClientTransportPlugin/UseBridges/Bridge arguments on top of baseArgs.
+func buildBridgeArgs(base string, baseArgs []string, lines []bridgeLine) ([]string, error) {
+	lyrebirdPath, err := extractLyrebird(filepath.Join(base, "bin"))
+	if err != nil {
+		return nil, err
+	}
+	if shortPath, serr := toShortPath(lyrebirdPath); serr == nil {
+		lyrebirdPath = shortPath
+	} else {
+		log.Printf("warning: could not get short path for %s (%v) - if your folder path has spaces, bridges may fail to start", lyrebirdPath, serr)
+	}
+	args := append([]string{}, baseArgs...)
+	args = append(args, "--ClientTransportPlugin", "obfs4,webtunnel exec "+lyrebirdPath, "--UseBridges", "1")
+	for _, b := range lines {
+		args = append(args, "--Bridge", b)
+	}
+	return args, nil
+}
+
+// attemptOnce starts a fresh embedded Tor core with the given args and
+// tries to bootstrap within timeout. On any failure it closes the core
+// itself before returning, so the caller never has to clean up a failed
+// attempt.
+func attemptOnce(ctx context.Context, base string, extraArgs []string, timeout time.Duration, internalSocksAddr string) (*tor.Tor, *tor.Dialer, bool) {
+	startConf := &tor.StartConf{
+		ProcessCreator:    libtor.Creator,
+		DataDir:           filepath.Join(base, "state"),
+		RetainTempDataDir: true,
+		NoAutoSocksPort:   true,
+		ExtraArgs:         extraArgs,
+	}
+	t, err := tor.Start(nil, startConf)
+	if err != nil {
+		log.Printf("  could not start tor core: %v", err)
+		return nil, nil, false
+	}
+	dialer, err := t.Dialer(ctx, &tor.DialConf{ProxyAddress: internalSocksAddr})
+	if err != nil {
+		log.Printf("  could not create dialer: %v", err)
+		t.Close()
+		time.Sleep(2 * time.Second)
+		return nil, nil, false
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	conn, derr := dialer.DialContext(attemptCtx, "tcp", "check.torproject.org:80")
+	cancel()
+	if derr != nil {
+		log.Printf("  did not bootstrap within %s: %v", timeout, derr)
+		t.Close()
+		time.Sleep(2 * time.Second) // give the lock file a moment to release
+		return nil, nil, false
+	}
+	conn.Close()
+	return t, dialer, true
+}
+
+// bootstrapCascade tries, in order: a direct connection, the bridges from
+// config.json, then each bridge_source.urls feed. Returns the first
+// working Tor instance/dialer, and which bridge lines (if any) worked.
+func bootstrapCascade(ctx context.Context, cfg *config, base string, internalSocksAddr string) (*tor.Tor, *tor.Dialer, []bridgeLine, bool) {
+	baseArgs := []string{"--SocksPort", internalSocksAddr}
+	if cfg.UpstreamSocks5.Address != "" {
+		log.Printf("routing through upstream SOCKS5 proxy: %s", cfg.UpstreamSocks5.Address)
+		baseArgs = append(baseArgs, "--Socks5Proxy", cfg.UpstreamSocks5.Address)
+	}
+
+	log.Println("[cascade] trying a direct connection...")
+	if t, d, ok := attemptOnce(ctx, base, baseArgs, 90*time.Second, internalSocksAddr); ok {
+		return t, d, nil, true
+	}
+
+	if len(cfg.Bridges) > 0 {
+		log.Printf("[cascade] direct failed - trying %d bridge(s) from config...", len(cfg.Bridges))
+		if args, err := buildBridgeArgs(base, baseArgs, cfg.Bridges); err != nil {
+			log.Printf("  could not prepare bridges: %v", err)
+		} else if t, d, ok := attemptOnce(ctx, base, args, bridgeTimeout(len(cfg.Bridges)), internalSocksAddr); ok {
+			return t, d, cfg.Bridges, true
+		}
+	}
+
+	if len(cfg.BridgeSource.URLs) > 0 {
+		log.Println("[cascade] configured bridges failed - trying bridge_source.urls...")
+		for _, url := range cfg.BridgeSource.URLs {
+			fetched, updated, ferr := fetchBridges(url)
+			if ferr != nil {
+				log.Printf("  %s: %v", url, ferr)
+				continue
+			}
+			log.Printf("  %s: got %d bridge(s) (feed updated: %s)", url, len(fetched), updated)
+			args, err := buildBridgeArgs(base, baseArgs, fetched)
+			if err != nil {
+				log.Printf("  could not prepare bridges: %v", err)
+				continue
+			}
+			if t, d, ok := attemptOnce(ctx, base, args, bridgeTimeout(len(fetched)), internalSocksAddr); ok {
+				return t, d, fetched, true
+			}
+		}
+	}
+
+	return nil, nil, nil, false
+}
+
 func runApp(ctx context.Context) {
 	base := filepath.Join(exeDir(), "slake")
 	migrateOldFolder(base)
@@ -739,106 +842,21 @@ func runApp(ctx context.Context) {
 
 	const internalSocksAddr = "127.0.0.1:19050"
 
-	startConf := &tor.StartConf{
-		ProcessCreator:    libtor.Creator,
-		DataDir:           filepath.Join(base, "state"),
-		RetainTempDataDir: true,
-		NoAutoSocksPort:   true, // we set our own single SocksPort below instead
-	}
-
-	args := []string{"--SocksPort", internalSocksAddr}
-	if cfg.UpstreamSocks5.Address != "" {
-		log.Printf("routing through upstream SOCKS5 proxy: %s", cfg.UpstreamSocks5.Address)
-		args = append(args, "--Socks5Proxy", cfg.UpstreamSocks5.Address)
-	}
-	bridgeLines := cfg.Bridges
-	usingBridges := len(bridgeLines) > 0
-
-	if !usingBridges && len(cfg.BridgeSource.URLs) > 0 {
-		log.Println("no bridges configured - checking whether the network looks blocked before trying...")
-		if networkLooksBlocked() {
-			log.Println("direct connection looks blocked - trying bridge_source.urls in order...")
-			for _, url := range cfg.BridgeSource.URLs {
-				fetched, updated, err := fetchBridges(url)
-				if err != nil {
-					log.Printf("  %s: %v", url, err)
-					continue
-				}
-				log.Printf("  %s: got %d bridge(s) (feed updated: %s)", url, len(fetched), updated)
-				bridgeLines = fetched
-				usingBridges = true
-				break
-			}
-			if !usingBridges {
-				log.Println("none of the bridge_source.urls worked - continuing without bridges, it will likely fail to bootstrap.")
-			}
-		} else {
-			log.Println("network looks reachable - trying a direct connection first")
-		}
-	}
-
-	if usingBridges {
-		log.Printf("starting with %d bridge line(s)", len(bridgeLines))
-		lyrebirdPath, err := extractLyrebird(filepath.Join(base, "bin"))
-		if err != nil {
-			log.Fatalf("extracting transport binary: %v", err)
-		}
-		if shortPath, serr := toShortPath(lyrebirdPath); serr == nil {
-			lyrebirdPath = shortPath
-		} else {
-			log.Printf("warning: could not get short path for %s (%v) - if your folder path has spaces, bridges may fail to start", lyrebirdPath, serr)
-		}
-		args = append(args, "--ClientTransportPlugin", "obfs4,webtunnel exec "+lyrebirdPath, "--UseBridges", "1")
-		for _, b := range bridgeLines {
-			args = append(args, "--Bridge", b)
-		}
-	} else {
-		log.Println("no bridges configured - trying a direct connection first")
-	}
-	startConf.ExtraArgs = args
-
-	log.Println("starting embedded Tor core (first run can take a while)...")
-	t, err := tor.Start(nil, startConf)
-	if err != nil {
-		log.Fatalf("failed to start tor: %v", err)
-	}
-	defer t.Close()
-	go func() { <-ctx.Done(); t.Close() }()
-
-	perAttemptTimeout := 90 * time.Second
-	if usingBridges {
-		perAttemptTimeout = time.Duration(len(bridgeLines)) * 2 * time.Minute
-		if perAttemptTimeout < 5*time.Minute {
-			perAttemptTimeout = 5 * time.Minute
-		}
-		log.Printf("with %d bridge(s) configured, giving Tor up to %s per attempt", len(bridgeLines), perAttemptTimeout)
-	}
-
-	dialer, err := t.Dialer(ctx, &tor.DialConf{ProxyAddress: internalSocksAddr})
-	if err != nil {
-		log.Fatalf("failed to create dialer: %v", err)
-	}
-
 	backoff := 1 * time.Minute
 	const maxBackoff = 30 * time.Minute
-	bootstrapped := false
-	for attempt := 1; !bootstrapped; attempt++ {
-		attemptCtx, cancel := context.WithTimeout(ctx, perAttemptTimeout)
-		conn, derr := dialer.DialContext(attemptCtx, "tcp", "check.torproject.org:80")
-		cancel()
-		if derr == nil {
-			conn.Close()
-			bootstrapped = true
+	var t *tor.Tor
+	var dialer *tor.Dialer
+	var usedBridges []bridgeLine
+	for {
+		var ok bool
+		t, dialer, usedBridges, ok = bootstrapCascade(ctx, cfg, base, internalSocksAddr)
+		if ok {
 			break
 		}
-		if attempt == 1 && !usingBridges {
-			log.Println("could not connect directly - the network may be blocking Tor.")
-			log.Println("To use bridges: open slake/config.json, get bridge lines from")
-			log.Println("Tor Browser's built-in bridge menu, https://bridges.torproject.org,")
-			log.Println("or the @GetBridgesBot Telegram bot, paste them into \"bridges\", and")
-			log.Println("restart this program.")
+		log.Printf("everything failed (direct, config bridges, bridge_source) - retrying the whole cascade in %s", backoff)
+		if len(cfg.Bridges) == 0 && len(cfg.BridgeSource.URLs) == 0 {
+			log.Println("no bridges or bridge_source configured - see HELP-bridges.txt in the tor-bundle-windows repo for how to get some.")
 		}
-		log.Printf("bootstrap attempt %d failed (%v) - this could just mean no internet yet; retrying in %s", attempt, derr, backoff)
 		select {
 		case <-ctx.Done():
 			return
@@ -849,6 +867,9 @@ func runApp(ctx context.Context) {
 			backoff = maxBackoff
 		}
 	}
+	usingBridges := len(usedBridges) > 0
+	defer t.Close()
+	go func() { <-ctx.Done(); t.Close() }()
 	log.Println("Tor bootstrapped, network reachable.")
 
 	if err := startProxy(net.JoinHostPort(cfg.ListenAddress, strconv.Itoa(cfg.ProxyPort)), dialer.DialContext); err != nil {
